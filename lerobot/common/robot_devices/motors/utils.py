@@ -1,5 +1,11 @@
-from typing import Protocol
+from __future__ import annotations
 
+from typing import Protocol, TYPE_CHECKING
+
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
+    import numpy as np
 
 class MotorsBus(Protocol):
 
