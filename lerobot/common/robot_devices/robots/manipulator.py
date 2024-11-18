@@ -462,8 +462,8 @@ class ManipulatorRobot:
             self.follower_arms[name].write("Lock", 0)
             # Set Maximum_Acceleration to 254 to speedup acceleration and deceleration of
             # the motors. Note: this configuration is not in the official STS3215 Memory Table
-            self.follower_arms[name].write("Maximum_Acceleration", 100)
-            self.follower_arms[name].write("Acceleration", 100)
+            self.follower_arms[name].write("Maximum_Acceleration", 180)
+            self.follower_arms[name].write("Acceleration", 180)
 
     def teleop_step(
         self, record_data=False
