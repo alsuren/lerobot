@@ -4,14 +4,37 @@ from threading import Thread
 from typing import TYPE_CHECKING
 
 import numpy as np
+from teleop import Teleop
+import ikpy
+import ikpy.chain
 
 from lerobot.common.robot_devices.motors.feetech import TorqueMode
-from teleop import Teleop
+
 
 # This is relative to the zero position from examples/10_use_so100.md assuming you calibrated
 # everything correctly (which I struggled with, and still don't have perfect)
-# FIXME: why does the follower robot inch down by ~0.5cm every time I restart the program?
-INITIAL_POSITION = np.array([0, 90, 90, 90, 0, 0])
+INITIAL_ANGLES = np.array(
+    [
+        # orientation of base link, to make ikpy happy
+        0,
+        0,
+        # FIXME: why does the follower robot inch down by ~0.5cm every time I restart the program?
+        90 + 30,
+        90,
+        90,
+        0,
+        0,
+    ]
+)
+
+
+def degrees_to_radians(degrees: np.ndarray) -> np.ndarray:
+    return degrees * np.pi / 180
+
+
+def radians_to_degrees(radians: np.ndarray) -> np.ndarray:
+    return radians * 180 / np.pi
+
 
 class TeleopFakeMotorBus:
     """
@@ -42,6 +65,58 @@ class TeleopFakeMotorBus:
     # without moving the robot (like how sixdofone works).
     teleop_current_pose: np.ndarray | None = None
     teleop_current_message: dict | None = None
+    ik_chain: ikpy.chain.Chain
+
+    # This returns a 4x4 transformation matrix given the position in space and orientation of the tip of your chain. This matrix is in homogeneous coordinates:
+    #
+    # matrix[:3, :3] (first 3 rows and 3 columns) is the orientation of the end effector
+    # matrix[:3, 3] (first 3 rows of the last column) is the position of the end-effector
+    # -- https://github.com/Phylliade/ikpy/wiki#getting-the-position-of-your-chain-aka-forward-kinematics-aka-fk
+    initial_position: np.ndarray
+
+    def __init__(self):
+
+        self.ik_chain = ikpy.chain.Chain.from_urdf_file(
+            "../SO-ARM100/URDF/SO_5DOF_ARM100_8j_URDF.SLDASM/urdf/SO_5DOF_ARM100_8j_URDF.SLDASM.urdf",
+            base_elements=["Base"],
+            active_links_mask=[False, True, True, True, True, True, False],
+        )
+
+        # add "Base" to the start of the angles
+        self.initial_position = self.ik_chain.forward_kinematics(
+            degrees_to_radians(INITIAL_ANGLES)
+        )  # type: ignore - list case only happens if we say full_kinematics=True
+
+        # Try round-tripping
+        initial_angles_inverse = self.ik_chain.inverse_kinematics(
+            self.initial_position[:3, 3],
+            self.initial_position[:3, :3],
+        )
+        round_tripped_initial_position: np.ndarray = self.ik_chain.forward_kinematics(
+            initial_angles_inverse
+        )
+        initial_angles_roundtripped = self.ik_chain.inverse_kinematics(
+            round_tripped_initial_position[:3, 3],
+            round_tripped_initial_position[:3, :3],
+        )
+        # print(
+        #     f"initial_position:\n{np.array2string(self.initial_position, floatmode='fixed')}"
+        # )
+        # print(
+        #     f"round_tripped_initial_position:\n{np.array2string(round_tripped_initial_position, floatmode='fixed')}"
+        # )
+        # assert np.allclose(self.initial_position, round_tripped_initial_position)
+        # assert np.allclose(self.initial_position, round_tripped_initial_position)
+
+        print(
+            f"initial_angles_inverse:\n{[f'{num:.3f}' for num in radians_to_degrees(initial_angles_inverse)]}"
+        )
+        print(
+            f"initial_angles_roundtripped:\n{[f'{num:.3f}' for num in radians_to_degrees(initial_angles_roundtripped)]}"
+        )
+        print(f"INITIAL_ANGLES:\n{[f'{num:.3f}' for num in INITIAL_ANGLES]}")
+        # print(f"Initial angles inverse: {initial_angles_inverse}")
+        assert np.allclose(initial_angles_inverse, initial_angles_roundtripped)
 
     def connect(self) -> None:
         print("Connecting to Teleop")
@@ -57,6 +132,8 @@ class TeleopFakeMotorBus:
     def _teleop_callback(self, pose: np.ndarray, message: dict) -> None:
 
         if self.teleop_start_pose is None:
+            # this will *always* be eye(4) because we're starting from the zero position
+            print(f"Setting start pose:\n{pose}")
             self.teleop_start_pose = pose
         if self.teleop_start_message is None:
             self.teleop_start_message = message
@@ -85,12 +162,12 @@ class TeleopFakeMotorBus:
     def revert_calibration(self) -> None:
         raise NotImplementedError("This is a fake motor, you can't write to it")
 
-    def read(self, data_name: str) -> NDArray[np.int64]:
+    def read(self, data_name: str) -> np.ndarray:
         if data_name == "Torque_Enable":
             return np.array([TorqueMode.DISABLED.value])
         if data_name == "Present_Position":
             if self.teleop_start_message is None or self.teleop_current_message is None:
-                return INITIAL_POSITION
+                return INITIAL_ANGLES
 
             offset_x = (
                 self.teleop_current_message["position"]["x"]
@@ -104,17 +181,33 @@ class TeleopFakeMotorBus:
                 self.teleop_current_message["position"]["z"]
                 - self.teleop_start_message["position"]["z"]
             )
+
+            print()
+            inverse_kinematics_angles = radians_to_degrees(
+                self.ik_chain.inverse_kinematics(
+                    self.initial_position[:3, 3]
+                    + np.array([offset_x, offset_y, offset_z])
+                )
+            )[
+                1:
+            ]  # skip the base
             print(f"offset_x: {offset_x}, offset_y: {offset_y}, offset_z: {offset_z}")
             # TODO: inverse kinematics to convert pose to motor positions
+            print(
+                f"inverse_kinematics_angles: {[f'{num:.3f}' for num in inverse_kinematics_angles]}"
+            )
 
-            return INITIAL_POSITION
+            angle_differences = np.array(inverse_kinematics_angles) - INITIAL_ANGLES
+
+            print(f"angle_differences: {[f'{num:.3f}' for num in angle_differences]}")
+            return INITIAL_ANGLES
 
         raise NotImplementedError(f"TODO: read({data_name})")
 
     def write(
         self,
         data_name: str,
-        values: int | float | NDArray[np.int64] | NDArray[np.float64],
+        values: int | float | np.ndarray,
         motor_names: str | list[str] | None = None,
     ) -> None:
         # We allow a bunch of writes that basically set the thing into follower mode
@@ -122,12 +215,3 @@ class TeleopFakeMotorBus:
             return
 
         raise NotImplementedError("This is a fake motor, you can't write to it")
-
-
-if TYPE_CHECKING:
-    from numpy.typing import NDArray
-
-    from lerobot.common.robot_devices.motors.utils import MotorsBus
-
-    # Check that we implement the protocol
-    _: MotorsBus = TeleopFakeMotorBus()

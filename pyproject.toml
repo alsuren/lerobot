@@ -72,6 +72,7 @@ pyrender = {git = "https://github.com/mmatl/pyrender.git", markers = "sys_platfo
 hello-robot-stretch-body = {version = ">=0.7.27", markers = "sys_platform == 'linux'", optional = true}
 pyserial = {version = ">=3.5", optional = true}
 teleop = {version = ">=0.0.7", optional = true}
+ikpy = {version = ">=3.4.2", optional = true}
 
 
 [tool.poetry.extras]
@@ -87,7 +88,7 @@ dynamixel = ["dynamixel-sdk", "pynput"]
 feetech = ["feetech-servo-sdk", "pynput"]
 intelrealsense = ["pyrealsense2"]
 stretch = ["hello-robot-stretch-body", "pyrender", "pyrealsense2", "pynput"]
-teleop = ["teleop"]
+teleop = ["teleop", "ikpy"]
 
 [tool.ruff]
 line-length = 110
