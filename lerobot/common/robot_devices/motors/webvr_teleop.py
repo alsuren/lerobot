@@ -10,6 +10,16 @@ import ikpy.chain
 
 from lerobot.common.robot_devices.motors.feetech import TorqueMode
 
+from typing import TypeVar
+
+T = TypeVar("T")
+
+
+def dbg(t: T) -> T:
+    """like rust's dbg!() macro"""
+    print(t)
+    return t
+
 
 # This is relative to the zero position from examples/10_use_so100.md assuming you calibrated
 # everything correctly (which I struggled with, and still don't have perfect)
@@ -17,12 +27,18 @@ INITIAL_ANGLES = np.array(
     [
         # orientation of base link, to make ikpy happy
         0,
+        # shoulder rotation
         0,
+        # shoulder lift
         # FIXME: why does the follower robot inch down by ~0.5cm every time I restart the program?
         90 + 30,
+        # elbow lift
         90,
+        # wrist lift
         90,
+        # wrist roll
         0,
+        # always 0 - represents fixed link from wrist roll to tip of static jaw
         0,
     ]
 )
@@ -65,7 +81,7 @@ class TeleopFakeMotorBus:
     # without moving the robot (like how sixdofone works).
     teleop_current_pose: np.ndarray | None = None
     teleop_current_message: dict | None = None
-    ik_chain: ikpy.chain.Chain
+    chain: ikpy.chain.Chain
 
     # This returns a 4x4 transformation matrix given the position in space and orientation of the tip of your chain. This matrix is in homogeneous coordinates:
     #
@@ -76,26 +92,39 @@ class TeleopFakeMotorBus:
 
     def __init__(self):
 
-        self.ik_chain = ikpy.chain.Chain.from_urdf_file(
+        # FIXME: find a way to load the links from URDF and remove the gripper *before* we construct the chain
+        self.chain = ikpy.chain.Chain.from_urdf_file(
             "../SO-ARM100/URDF/SO_5DOF_ARM100_8j_URDF.SLDASM/urdf/SO_5DOF_ARM100_8j_URDF.SLDASM.urdf",
             base_elements=["Base"],
-            active_links_mask=[False, True, True, True, True, True, False],
+            active_links_mask=[False, True, True, True, True, True, False, False],
+            name="SO-ARM100",
+            # Distance from wrist roll to tip of static jaw, measured with a tape measure.
+            last_link_vector=np.array([0, -0.11, 0.0]),
+        )
+        # We don't want the gripper to be part of the chain, so we remove it
+        self.chain.links.remove(self.chain.links[-2])
+        self.chain.active_links_mask = np.array(
+            [False, True, True, True, True, True, False]
         )
 
-        # add "Base" to the start of the angles
-        self.initial_position = self.ik_chain.forward_kinematics(
+        self.initial_position = self.chain.forward_kinematics(
             degrees_to_radians(INITIAL_ANGLES)
         )  # type: ignore - list case only happens if we say full_kinematics=True
+        # full_initial_position: list[np.ndarray] = self.chain.forward_kinematics(
+        #     degrees_to_radians(INITIAL_ANGLES),
+        #     full_kinematics=True,
+        # )
+        # self.chain.plot(full_initial_position, show=True)
 
         # Try round-tripping
-        initial_angles_inverse = self.ik_chain.inverse_kinematics(
+        initial_angles_inverse = self.chain.inverse_kinematics(
             self.initial_position[:3, 3],
             self.initial_position[:3, :3],
         )
-        round_tripped_initial_position: np.ndarray = self.ik_chain.forward_kinematics(
-            initial_angles_inverse
+        round_tripped_initial_position: np.ndarray = self.chain.forward_kinematics(
+            dbg(initial_angles_inverse)
         )
-        initial_angles_roundtripped = self.ik_chain.inverse_kinematics(
+        initial_angles_roundtripped = self.chain.inverse_kinematics(
             round_tripped_initial_position[:3, 3],
             round_tripped_initial_position[:3, :3],
         )
@@ -105,7 +134,10 @@ class TeleopFakeMotorBus:
         # print(
         #     f"round_tripped_initial_position:\n{np.array2string(round_tripped_initial_position, floatmode='fixed')}"
         # )
-        # assert np.allclose(self.initial_position, round_tripped_initial_position)
+        dbg(self.initial_position - round_tripped_initial_position)
+        assert np.allclose(
+            dbg(self.initial_position), dbg(round_tripped_initial_position)
+        )
         # assert np.allclose(self.initial_position, round_tripped_initial_position)
 
         print(
@@ -167,7 +199,7 @@ class TeleopFakeMotorBus:
             return np.array([TorqueMode.DISABLED.value])
         if data_name == "Present_Position":
             if self.teleop_start_message is None or self.teleop_current_message is None:
-                return INITIAL_ANGLES
+                return INITIAL_ANGLES[1:]
 
             offset_x = (
                 self.teleop_current_message["position"]["x"]
@@ -184,13 +216,11 @@ class TeleopFakeMotorBus:
 
             print()
             inverse_kinematics_angles = radians_to_degrees(
-                self.ik_chain.inverse_kinematics(
+                self.chain.inverse_kinematics(
                     self.initial_position[:3, 3]
                     + np.array([offset_x, offset_y, offset_z])
                 )
-            )[
-                1:
-            ]  # skip the base
+            )
             print(f"offset_x: {offset_x}, offset_y: {offset_y}, offset_z: {offset_z}")
             # TODO: inverse kinematics to convert pose to motor positions
             print(
@@ -200,7 +230,7 @@ class TeleopFakeMotorBus:
             angle_differences = np.array(inverse_kinematics_angles) - INITIAL_ANGLES
 
             print(f"angle_differences: {[f'{num:.3f}' for num in angle_differences]}")
-            return INITIAL_ANGLES
+            return INITIAL_ANGLES[1:]
 
         raise NotImplementedError(f"TODO: read({data_name})")
 
