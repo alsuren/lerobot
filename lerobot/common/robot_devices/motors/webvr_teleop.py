@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from threading import Thread
 from typing import TYPE_CHECKING
 
@@ -7,6 +8,7 @@ import numpy as np
 from teleop import Teleop
 import pytorch_kinematics as pk
 import torch
+import rerun as rr
 
 
 from lerobot.common.robot_devices.motors.feetech import TorqueMode
@@ -31,6 +33,15 @@ def dbg(t: T) -> T:
     """
     print(t)
     return t
+
+
+def to_rr(x):
+    if isinstance(x, pk.Transform3d):
+        return rr.Arrows3D(
+            origins=x.transform_points(torch.tensor([[0.0, 0, 0]]))[0],
+            vectors=x.transform_normals(torch.tensor([[0, 0, 0.1]]))[0],
+        )
+    raise NotImplementedError(f"to_rr({x}: {type(x)})")
 
 
 # This is the zero position in the URDF relative to the zero position from examples/10_use_so100.md
@@ -106,21 +117,11 @@ class TeleopFakeMotorBus:
     thread: Thread | None = None
 
     # 4x4 matrix representing the pose of the robot
-    teleop_start_pose: np.ndarray | None = None
-    # e.g:
-    # {
-    #   'position': {'x': -0.04314558207988739, 'y': 1.3012554049491882, 'z': -0.047798436135053635},
-    #   'orientation': {'x': -0.43354870848335736, 'y': 0.139184260084663, 'z': 0.09361725956363014, 'w': 0.8853807473787159},
-    #   'move': False,
-    #   'reference_frame': 'base',
-    # }
-    # TODO: make a type for this and contribute it upstream.
-    teleop_start_message: dict | None = None
-
+    teleop_start_position: pk.Transform3d | None = None
     # TODO: also make a "press to move" mode so we can put the phone down when we're tired
     # without moving the robot (like how sixdofone works).
-    teleop_current_pose: np.ndarray | None = None
-    teleop_current_message: dict | None = None
+    teleop_current_position: pk.Transform3d | None = None
+
     chain: pk.SerialChain
 
     initial_position: pk.Transform3d
@@ -130,6 +131,10 @@ class TeleopFakeMotorBus:
     current_angles_urdf: torch.Tensor
 
     def __init__(self):
+        # FIXME: this isn't going to play nicely with other uses of rerun in the same process.
+        # Should probably create a recording or something?
+        rr.init("teleop_fake_motor_bus")
+        rr.connect()
 
         # FIXME: check this file into lerobot repo or make it configurable in the yaml?
         full_chain = pk.build_chain_from_urdf(
@@ -177,16 +182,36 @@ class TeleopFakeMotorBus:
         teleop.run()
 
     def _teleop_callback(self, pose: np.ndarray, message: dict) -> None:
+        position = pk.Transform3d(
+            pos=[
+                message["position"]["x"],
+                message["position"]["y"],
+                message["position"]["z"],
+            ],
+            rot=[
+                message["orientation"]["w"],
+                message["orientation"]["x"],
+                message["orientation"]["y"],
+                message["orientation"]["z"],
+            ],
+        )
 
-        if self.teleop_start_pose is None:
+        if self.teleop_start_position is None:
             # this will *always* be eye(4) because we're starting from the zero position
-            print(f"Setting start pose:\n{pose}")
-            self.teleop_start_pose = pose
-        if self.teleop_start_message is None:
-            self.teleop_start_message = message
 
-        self.teleop_current_pose = pose
-        self.teleop_current_message = message
+            self.teleop_start_position = position
+            print(f"Setting start pose:\n{self.teleop_start_position}")
+
+        self.teleop_target_position = position
+
+        rr.log(
+            "teleop_target_position_offset",
+            to_rr(
+                self.teleop_start_position.inverse().compose(
+                    self.teleop_target_position
+                )
+            ),
+        )
 
     def disconnect(self) -> None:
         pass
@@ -213,32 +238,28 @@ class TeleopFakeMotorBus:
         if data_name == "Torque_Enable":
             return np.array([TorqueMode.DISABLED.value])
         if data_name == "Present_Position":
-            if self.teleop_start_message is None or self.teleop_current_message is None:
+            if (
+                self.teleop_start_position is None
+                or self.teleop_current_position is None
+            ):
                 return INITIAL_ANGLES_OFFSET + radians_to_degrees(
                     np.array(list(self.current_angles_urdf) + [0])
                 )
 
-            offset_x = (
-                self.teleop_current_message["position"]["x"]
-                - self.teleop_start_message["position"]["x"]
-            ) / 10
-            offset_y = (
-                self.teleop_current_message["position"]["y"]
-                - self.teleop_start_message["position"]["y"]
-            ) / 10
-            offset_z = (
-                self.teleop_current_message["position"]["z"]
-                - self.teleop_start_message["position"]["z"]
-            ) / 10
+            offset = self.teleop_target_position.compose(
+                self.teleop_start_position.inverse()
+            )
 
-            print()
+            target_position = self.initial_position.compose(
+                # FIXME: invert the rotation of initial position before applying the teleop offset
+                # and then re-apply it after, so we're not teleoperating upside down
+                offset
+            )
+            # rr.log("target_position", to_rr(target_position))
             try:
                 inverse_kinematics_angles = get_angles_for_target_position(
                     self.chain,
-                    target_position=self.initial_position.compose(
-                        pk.Transform3d(pos=[offset_x, offset_y, offset_z])
-                        # FIXME: rotation
-                    ),
+                    target_position=target_position,
                     current_angles=self.current_angles_urdf,
                 )
                 print(f"{inverse_kinematics_angles=}")
@@ -246,7 +267,6 @@ class TeleopFakeMotorBus:
                 print(f"IK failed to converge: {e}")
                 inverse_kinematics_angles = self.current_angles_urdf
 
-            print(f"offset_x: {offset_x}, offset_y: {offset_y}, offset_z: {offset_z}")
             # TODO: inverse kinematics to convert pose to motor positions
             print(
                 f"inverse_kinematics_angles: {[f'{num:.3f}' for num in radians_to_degrees(inverse_kinematics_angles)]}"
