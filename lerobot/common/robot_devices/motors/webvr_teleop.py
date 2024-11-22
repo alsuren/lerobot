@@ -5,28 +5,38 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from teleop import Teleop
-import ikpy
-import ikpy.chain
+import pytorch_kinematics as pk
+import torch
+
 
 from lerobot.common.robot_devices.motors.feetech import TorqueMode
 
 from typing import TypeVar
 
 T = TypeVar("T")
+AnyTensor = TypeVar("AnyTensor", np.ndarray, torch.Tensor)
 
 
 def dbg(t: T) -> T:
-    """like rust's dbg!() macro"""
+    """
+    like rust's dbg!() macro (so you can print intermediate values without needing to assign temporary variables)
+
+    e.g:
+    >>> dbg(max(dbg(1), dbg(2)))
+    1
+    2
+    2
+
+    TODO: make it walk up the stack and print the line/statement that called dbg(), like rust's dbg!() macro.
+    """
     print(t)
     return t
 
 
-# This is relative to the zero position from examples/10_use_so100.md assuming you calibrated
-# everything correctly (which I struggled with, and still don't have perfect)
-INITIAL_ANGLES = np.array(
+# This is the zero position in the URDF relative to the zero position from examples/10_use_so100.md
+# assuming you calibrated everything correctly (which I struggled with, and still don't have perfect)
+INITIAL_ANGLES_OFFSET = np.array(
     [
-        # orientation of base link, to make ikpy happy
-        0,
         # shoulder rotation
         0,
         # shoulder lift
@@ -44,12 +54,42 @@ INITIAL_ANGLES = np.array(
 )
 
 
-def degrees_to_radians(degrees: np.ndarray) -> np.ndarray:
+def degrees_to_radians(degrees: AnyTensor) -> AnyTensor:
     return degrees * np.pi / 180
 
 
-def radians_to_degrees(radians: np.ndarray) -> np.ndarray:
+def radians_to_degrees(radians: AnyTensor) -> AnyTensor:
     return radians * 180 / np.pi
+
+
+def get_angles_for_target_position(
+    chain: pk.SerialChain, target_position: pk.Transform3d, current_angles: torch.Tensor
+) -> torch.Tensor:
+    """
+    returns the joint angles that will move the robot to the target position (inverse kinematics)
+
+    All angles are assumed to be in radians, as described in the URDF.
+
+    raises ValueError if it's not possible.
+    """
+    # FIXME: the URDF doesn't actually have joint limits, this becomes -π to π in each case.
+    lim = torch.tensor(chain.get_joint_limits())
+    # FIXME: Is this expensive? Should we cache this and just set ik.initial_configs before each ik.solve()?
+    ik = pk.PseudoInverseIK(
+        chain,
+        max_iterations=500,
+        retry_configs=current_angles.unsqueeze(0) + 0.01,
+        joint_limits=lim.T,
+        early_stopping_any_converged=True,
+        early_stopping_no_improvement="all",
+        lr=0.2,
+    )
+    sense_check_solution = ik.solve(target_position)
+
+    if not sense_check_solution.converged_any:
+        raise ValueError("IK failed to converge")
+
+    return sense_check_solution.solutions[-1][0]
 
 
 class TeleopFakeMotorBus:
@@ -81,74 +121,49 @@ class TeleopFakeMotorBus:
     # without moving the robot (like how sixdofone works).
     teleop_current_pose: np.ndarray | None = None
     teleop_current_message: dict | None = None
-    chain: ikpy.chain.Chain
+    chain: pk.SerialChain
 
-    # This returns a 4x4 transformation matrix given the position in space and orientation of the tip of your chain. This matrix is in homogeneous coordinates:
-    #
-    # matrix[:3, :3] (first 3 rows and 3 columns) is the orientation of the end effector
-    # matrix[:3, 3] (first 3 rows of the last column) is the position of the end-effector
-    # -- https://github.com/Phylliade/ikpy/wiki#getting-the-position-of-your-chain-aka-forward-kinematics-aka-fk
-    initial_position: np.ndarray
+    initial_position: pk.Transform3d
+    current_position: pk.Transform3d
+
+    initial_angles_urdf: torch.Tensor
+    current_angles_urdf: torch.Tensor
 
     def __init__(self):
 
-        # FIXME: find a way to load the links from URDF and remove the gripper *before* we construct the chain
-        self.chain = ikpy.chain.Chain.from_urdf_file(
-            "../SO-ARM100/URDF/SO_5DOF_ARM100_8j_URDF.SLDASM/urdf/SO_5DOF_ARM100_8j_URDF.SLDASM.urdf",
-            base_elements=["Base"],
-            active_links_mask=[False, True, True, True, True, True, False, False],
-            name="SO-ARM100",
-            # Distance from wrist roll to tip of static jaw, measured with a tape measure.
-            last_link_vector=np.array([0, -0.11, 0.0]),
+        # FIXME: check this file into lerobot repo or make it configurable in the yaml?
+        full_chain = pk.build_chain_from_urdf(
+            open(
+                "../SO-ARM100/URDF/SO_5DOF_ARM100_8j_URDF.SLDASM/urdf/SO_5DOF_ARM100_8j_URDF.SLDASM.urdf",
+                mode="rb",
+            ).read()
         )
-        # We don't want the gripper to be part of the chain, so we remove it
-        self.chain.links.remove(self.chain.links[-2])
-        self.chain.active_links_mask = np.array(
-            [False, True, True, True, True, True, False]
-        )
+        full_chain.print_tree()
+        self.chain = pk.SerialChain(full_chain, "Fixed_Jaw")
 
-        self.initial_position = self.chain.forward_kinematics(
-            degrees_to_radians(INITIAL_ANGLES)
-        )  # type: ignore - list case only happens if we say full_kinematics=True
-        # full_initial_position: list[np.ndarray] = self.chain.forward_kinematics(
-        #     degrees_to_radians(INITIAL_ANGLES),
-        #     full_kinematics=True,
-        # )
-        # self.chain.plot(full_initial_position, show=True)
+        # sense check: can we round-trip the initial position?
+        # FIXME: turn this into a unit test instead
+        self.initial_angles_urdf = self.current_angles_urdf = torch.tensor(
+            [0.0] * self.chain.n_joints
+        )
+        self.initial_position = self.chain.forward_kinematics(self.current_angles_urdf)
+        print(f"self.initial_position:\n{self.initial_position}")
 
-        # Try round-tripping
-        initial_angles_inverse = self.chain.inverse_kinematics(
-            self.initial_position[:3, 3],
-            self.initial_position[:3, :3],
+        # the angles might differ from what we put in, because the system is not fully constrained,
+        # but we can make assertions about the position.
+        round_tripped_angles = get_angles_for_target_position(
+            self.chain,
+            target_position=self.initial_position,
+            current_angles=torch.tensor(self.current_angles_urdf),
         )
-        round_tripped_initial_position: np.ndarray = self.chain.forward_kinematics(
-            dbg(initial_angles_inverse)
-        )
-        initial_angles_roundtripped = self.chain.inverse_kinematics(
-            round_tripped_initial_position[:3, 3],
-            round_tripped_initial_position[:3, :3],
-        )
-        # print(
-        #     f"initial_position:\n{np.array2string(self.initial_position, floatmode='fixed')}"
-        # )
-        # print(
-        #     f"round_tripped_initial_position:\n{np.array2string(round_tripped_initial_position, floatmode='fixed')}"
-        # )
-        dbg(self.initial_position - round_tripped_initial_position)
-        assert np.allclose(
-            dbg(self.initial_position), dbg(round_tripped_initial_position)
-        )
-        # assert np.allclose(self.initial_position, round_tripped_initial_position)
+        round_tripped_position = self.chain.forward_kinematics(round_tripped_angles)
 
-        print(
-            f"initial_angles_inverse:\n{[f'{num:.3f}' for num in radians_to_degrees(initial_angles_inverse)]}"
+        print(f"round_tripped_position:\n{round_tripped_position}")
+        assert torch.allclose(
+            self.initial_position.get_matrix(),
+            round_tripped_position.get_matrix(),
+            atol=0.01,
         )
-        print(
-            f"initial_angles_roundtripped:\n{[f'{num:.3f}' for num in radians_to_degrees(initial_angles_roundtripped)]}"
-        )
-        print(f"INITIAL_ANGLES:\n{[f'{num:.3f}' for num in INITIAL_ANGLES]}")
-        # print(f"Initial angles inverse: {initial_angles_inverse}")
-        assert np.allclose(initial_angles_inverse, initial_angles_roundtripped)
 
     def connect(self) -> None:
         print("Connecting to Teleop")
@@ -199,38 +214,54 @@ class TeleopFakeMotorBus:
             return np.array([TorqueMode.DISABLED.value])
         if data_name == "Present_Position":
             if self.teleop_start_message is None or self.teleop_current_message is None:
-                return INITIAL_ANGLES[1:]
+                return INITIAL_ANGLES_OFFSET + radians_to_degrees(
+                    np.array(list(self.current_angles_urdf) + [0])
+                )
 
             offset_x = (
                 self.teleop_current_message["position"]["x"]
                 - self.teleop_start_message["position"]["x"]
-            )
+            ) / 10
             offset_y = (
                 self.teleop_current_message["position"]["y"]
                 - self.teleop_start_message["position"]["y"]
-            )
+            ) / 10
             offset_z = (
                 self.teleop_current_message["position"]["z"]
                 - self.teleop_start_message["position"]["z"]
-            )
+            ) / 10
 
             print()
-            inverse_kinematics_angles = radians_to_degrees(
-                self.chain.inverse_kinematics(
-                    self.initial_position[:3, 3]
-                    + np.array([offset_x, offset_y, offset_z])
+            try:
+                inverse_kinematics_angles = get_angles_for_target_position(
+                    self.chain,
+                    target_position=self.initial_position.compose(
+                        pk.Transform3d(pos=[offset_x, offset_y, offset_z])
+                        # FIXME: rotation
+                    ),
+                    current_angles=self.current_angles_urdf,
                 )
-            )
+                print(f"{inverse_kinematics_angles=}")
+            except ValueError as e:
+                print(f"IK failed to converge: {e}")
+                inverse_kinematics_angles = self.current_angles_urdf
+
             print(f"offset_x: {offset_x}, offset_y: {offset_y}, offset_z: {offset_z}")
             # TODO: inverse kinematics to convert pose to motor positions
             print(
-                f"inverse_kinematics_angles: {[f'{num:.3f}' for num in inverse_kinematics_angles]}"
+                f"inverse_kinematics_angles: {[f'{num:.3f}' for num in radians_to_degrees(inverse_kinematics_angles)]}"
             )
+            difference = inverse_kinematics_angles - self.current_angles_urdf
+            if torch.any(torch.abs(difference) > 0.1):
+                print(
+                    f"WARNING: large difference in angles: {difference}. Skipping update."
+                )
+            else:
+                self.current_angles_urdf = inverse_kinematics_angles
 
-            angle_differences = np.array(inverse_kinematics_angles) - INITIAL_ANGLES
-
-            print(f"angle_differences: {[f'{num:.3f}' for num in angle_differences]}")
-            return INITIAL_ANGLES[1:]
+            return INITIAL_ANGLES_OFFSET + radians_to_degrees(
+                np.array(list(self.current_angles_urdf) + [0])
+            )
 
         raise NotImplementedError(f"TODO: read({data_name})")
 
