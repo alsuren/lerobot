@@ -120,7 +120,7 @@ class TeleopFakeMotorBus:
     teleop_start_position: pk.Transform3d | None = None
     # TODO: also make a "press to move" mode so we can put the phone down when we're tired
     # without moving the robot (like how sixdofone works).
-    teleop_current_position: pk.Transform3d | None = None
+    teleop_target_position: pk.Transform3d | None = None
 
     chain: pk.SerialChain
 
@@ -183,11 +183,14 @@ class TeleopFakeMotorBus:
 
     def _teleop_callback(self, pose: np.ndarray, message: dict) -> None:
         position = pk.Transform3d(
-            pos=[
-                message["position"]["x"],
-                message["position"]["y"],
-                message["position"]["z"],
-            ],
+            pos=torch.tensor(
+                [
+                    message["position"]["x"],
+                    message["position"]["y"],
+                    message["position"]["z"],
+                ]
+            )
+            * 0.1,
             rot=[
                 message["orientation"]["w"],
                 message["orientation"]["x"],
@@ -240,14 +243,14 @@ class TeleopFakeMotorBus:
         if data_name == "Present_Position":
             if (
                 self.teleop_start_position is None
-                or self.teleop_current_position is None
+                or self.teleop_target_position is None
             ):
                 return INITIAL_ANGLES_OFFSET + radians_to_degrees(
                     np.array(list(self.current_angles_urdf) + [0])
                 )
 
-            offset = self.teleop_target_position.compose(
-                self.teleop_start_position.inverse()
+            offset = self.teleop_start_position.inverse().compose(
+                self.teleop_target_position
             )
 
             target_position = self.initial_position.compose(
@@ -255,7 +258,10 @@ class TeleopFakeMotorBus:
                 # and then re-apply it after, so we're not teleoperating upside down
                 offset
             )
-            # rr.log("target_position", to_rr(target_position))
+
+            target_position = pk.Transform3d(pos=target_position.get_matrix()[:, :3, 3])
+
+            rr.log("target_robot_position", to_rr(target_position))
             try:
                 inverse_kinematics_angles = get_angles_for_target_position(
                     self.chain,
@@ -267,12 +273,19 @@ class TeleopFakeMotorBus:
                 print(f"IK failed to converge: {e}")
                 inverse_kinematics_angles = self.current_angles_urdf
 
+            for i, (name, pos) in enumerate(
+                self.chain.forward_kinematics(
+                    inverse_kinematics_angles, end_only=False
+                ).items()
+            ):
+                rr.log(f"inverse/{i}-{name}-ik", to_rr(pos))
+
             # TODO: inverse kinematics to convert pose to motor positions
             print(
                 f"inverse_kinematics_angles: {[f'{num:.3f}' for num in radians_to_degrees(inverse_kinematics_angles)]}"
             )
             difference = inverse_kinematics_angles - self.current_angles_urdf
-            if torch.any(torch.abs(difference) > 0.1):
+            if torch.any(torch.abs(difference) > 5):
                 print(
                     f"WARNING: large difference in angles: {difference}. Skipping update."
                 )
